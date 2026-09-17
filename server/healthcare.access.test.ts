@@ -41,4 +41,9 @@ describe("healthcare organization access", () => {
     const result = await caller.organization.list();
     expect(Array.isArray(result)).toBe(true);
   });
+
+  it("keeps global management controls away from ordinary users", async () => {
+    const caller = appRouter.createCaller(createContext("user"));
+    await expect(caller.management.dashboard()).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
 });

@@ -8,6 +8,13 @@
       "when": 1789611599834,
       "tag": "0000_first_banshee",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1789612976784,
+      "tag": "0001_parched_lila_cheney",
+      "breakpoints": true
     }
   ]
 }

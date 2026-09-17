@@ -1,111 +1,97 @@
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
+import { and, eq } from "drizzle-orm";
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { createOrganization, createPatient, getMembership, getMembershipsForUser, listAppointments, listPatients, writeAuditLog } from "./db";
-import { getDb } from "./db";
-import { organizationInvites } from "../drizzle/schema";
+import { createAppointment, createOrganization, createPatient, createPrescription, createSupplyOrder, confirmSupplyOrder, dispensePrescription, findPrescription, getHospitalDashboard, getManagementDashboard, getMembership, getMembershipsForUser, getDb, listAppointments, listInventory, listOrganizations, listPatients, listPrescriptions, listSupplyOrders, seedSamplePatients, writeAuditLog } from "./db";
+import { documents, organizationInvites, organizationMembers, supplierProfiles, users } from "../drizzle/schema";
+import { storagePut } from "./storage";
 import { randomBytes } from "node:crypto";
 
-const membershipRole = z.enum(["hospital_admin", "doctor", "nurse", "receptionist", "laboratory_user", "radiology_user", "pharmacy_user", "auditor", "patient"]);
+const membershipRole = z.enum(["management", "hospital_admin", "doctor", "nurse", "receptionist", "laboratory_user", "radiology_user", "pharmacy_user", "supplier_user", "auditor", "patient"]);
 const organizationType = z.enum(["hospital", "clinic", "laboratory", "radiology", "pharmacy", "insurer", "other"]);
+const clinicalRoles = ["hospital_admin", "doctor", "nurse", "receptionist"];
+const prescriptionRoles = ["hospital_admin", "doctor"];
 
-async function requireOrganizationAccess(ctx: { user: NonNullable<Parameters<typeof getMembership>[0]> extends never ? never : { id: number; role: "user" | "admin" } }, organizationId: number, allowedRoles?: string[]) {
-  if (ctx.user.role === "admin") return { membership: null, organization: null };
+async function requireOrganizationAccess(ctx: { user: { id: number; role: string } }, organizationId: number, allowedRoles?: string[]) {
+  if (ctx.user.role === "admin" || ctx.user.role === "management") return { membership: null, organization: null };
   const access = await getMembership(ctx.user.id, organizationId);
   if (!access) throw new TRPCError({ code: "FORBIDDEN", message: "You are not a member of this organization." });
-  if (allowedRoles && !allowedRoles.includes(access.membership.role)) {
-    throw new TRPCError({ code: "FORBIDDEN", message: "Your organization role cannot access this resource." });
-  }
+  if (allowedRoles && !allowedRoles.includes(access.membership.role)) throw new TRPCError({ code: "FORBIDDEN", message: "Your organization role cannot access this resource." });
   return access;
+}
+
+function requireGlobalManagement(ctx: { user: { role: string } }) {
+  if (ctx.user.role !== "admin" && ctx.user.role !== "management") throw new TRPCError({ code: "FORBIDDEN", message: "Only platform management can perform this action." });
 }
 
 export const appRouter = router({
   system: systemRouter,
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
-      return { success: true } as const;
-    }),
+    logout: publicProcedure.mutation(({ ctx }) => { const cookieOptions = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 }); return { success: true } as const; }),
   }),
-
   workspace: router({
-    me: protectedProcedure.query(async ({ ctx }) => ({
-      user: ctx.user,
-      memberships: await getMembershipsForUser(ctx.user.id),
-    })),
+    me: protectedProcedure.query(async ({ ctx }) => ({ user: ctx.user, memberships: await getMembershipsForUser(ctx.user.id) })),
   }),
-
-  organization: router({
-    list: protectedProcedure.query(({ ctx }) => getMembershipsForUser(ctx.user.id)),
-    create: protectedProcedure.input(z.object({
-      name: z.string().trim().min(2).max(180),
-      type: organizationType,
-      province: z.string().trim().max(80).optional(),
-      district: z.string().trim().max(100).optional(),
-      address: z.string().trim().max(500).optional(),
-      registrationNumber: z.string().trim().max(120).optional(),
-    })).mutation(async ({ ctx, input }) => {
-      const organization = await createOrganization({ ...input, createdById: ctx.user.id });
-      await writeAuditLog({ organizationId: organization.id, actorUserId: ctx.user.id, action: "organization.created", entityType: "organization", entityId: String(organization.id) });
-      return organization;
-    }),
-    invite: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), email: z.string().email(), role: membershipRole })).mutation(async ({ ctx, input }) => {
-      await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin"]);
+  management: router({
+    dashboard: protectedProcedure.query(async ({ ctx }) => { requireGlobalManagement(ctx); return getManagementDashboard(); }),
+    organizations: protectedProcedure.query(async ({ ctx }) => { requireGlobalManagement(ctx); return listOrganizations(); }),
+    createHospital: protectedProcedure.input(z.object({ name: z.string().trim().min(2).max(180), province: z.string().trim().max(80).optional(), district: z.string().trim().max(100).optional(), address: z.string().trim().max(500).optional(), registrationNumber: z.string().trim().max(120).optional(), hospitalAdminEmail: z.string().email(), hospitalAdminName: z.string().trim().min(2).max(180) })).mutation(async ({ ctx, input }) => {
+      requireGlobalManagement(ctx);
+      const organization = await createOrganization({ name: input.name, type: "hospital", province: input.province, district: input.district, address: input.address, registrationNumber: input.registrationNumber, createdById: ctx.user.id, membershipRole: "management" });
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." });
       const token = randomBytes(32).toString("hex");
-      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-      await db.insert(organizationInvites).values({ ...input, token, invitedById: ctx.user.id, expiresAt });
-      await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "organization.invite.created", entityType: "invite", metadata: { email: input.email, role: input.role } });
-      return { token, expiresAt };
+      await db.insert(organizationInvites).values({ organizationId: organization.id, email: input.hospitalAdminEmail, role: "hospital_admin", token, invitedById: ctx.user.id, expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) });
+      await writeAuditLog({ organizationId: organization.id, actorUserId: ctx.user.id, action: "management.hospital.created", entityType: "organization", entityId: String(organization.id), metadata: { hospitalAdminEmail: input.hospitalAdminEmail, hospitalAdminName: input.hospitalAdminName } });
+      return { organization, inviteToken: token };
     }),
+    seedPatients: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).mutation(async ({ ctx, input }) => { requireGlobalManagement(ctx); return seedSamplePatients(input.organizationId, ctx.user.id); }),
+    setGlobalRole: protectedProcedure.input(z.object({ email: z.string().email(), role: z.enum(["user", "management"]) })).mutation(async ({ ctx, input }) => { if (ctx.user.role !== "admin") throw new TRPCError({ code: "FORBIDDEN", message: "Only the Super Admin can create or remove Management access." }); const db = await getDb(); if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." }); const result = await db.update(users).set({ role: input.role }).where(eq(users.email, input.email)); await writeAuditLog({ actorUserId: ctx.user.id, action: "management.global_role.updated", entityType: "user", metadata: { email: input.email, role: input.role } }); return { success: true, role: input.role, result }; }),
   }),
-
+  organization: router({
+    list: protectedProcedure.query(({ ctx }) => getMembershipsForUser(ctx.user.id)),
+    create: protectedProcedure.input(z.object({ name: z.string().trim().min(2).max(180), type: organizationType, province: z.string().trim().max(80).optional(), district: z.string().trim().max(100).optional(), address: z.string().trim().max(500).optional(), registrationNumber: z.string().trim().max(120).optional() })).mutation(async ({ ctx, input }) => { const organization = await createOrganization({ ...input, createdById: ctx.user.id }); await writeAuditLog({ organizationId: organization.id, actorUserId: ctx.user.id, action: "organization.created", entityType: "organization", entityId: String(organization.id) }); return organization; }),
+    invite: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), email: z.string().email(), role: membershipRole })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin"]); const db = await getDb(); if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." }); const token = randomBytes(32).toString("hex"); const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); await db.insert(organizationInvites).values({ ...input, token, invitedById: ctx.user.id, expiresAt }); await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "organization.invite.created", entityType: "invite", metadata: { email: input.email, role: input.role } }); return { token, expiresAt }; }),
+    acceptInvite: protectedProcedure.input(z.object({ token: z.string().trim().min(32).max(96) })).mutation(async ({ ctx, input }) => { const db = await getDb(); if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." }); const invite = (await db.select().from(organizationInvites).where(and(eq(organizationInvites.token, input.token), eq(organizationInvites.status, "pending"))).limit(1))[0]; if (!invite || invite.expiresAt < new Date()) throw new TRPCError({ code: "NOT_FOUND", message: "Invite is invalid or expired." }); if (ctx.user.email && ctx.user.email.toLowerCase() !== invite.email.toLowerCase()) throw new TRPCError({ code: "FORBIDDEN", message: "Sign in with the invited email address to accept this invite." }); await db.insert(organizationMembers).values({ organizationId: invite.organizationId, userId: ctx.user.id, role: invite.role, status: "active" }); await db.update(organizationInvites).set({ status: "accepted" }).where(eq(organizationInvites.id, invite.id)); return { organizationId: invite.organizationId, role: invite.role }; }),
+  }),
+  hospital: router({
+    dashboard: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "auditor"]); return getHospitalDashboard(input.organizationId); }),
+  }),
   patient: router({
-    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), query: z.string().trim().max(120).optional() })).query(async ({ ctx, input }) => {
-      const access = await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "doctor", "nurse", "receptionist", "laboratory_user", "radiology_user", "pharmacy_user", "auditor"]);
-      const result = await listPatients(input.organizationId, input.query);
-      await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "patient.list.viewed", entityType: "patient", metadata: { query: input.query ?? null, role: access.membership?.role ?? "admin" } });
-      return result;
-    }),
-    create: protectedProcedure.input(z.object({
-      organizationId: z.number().int().positive(),
-      patientNumber: z.string().trim().min(2).max(64),
-      fullName: z.string().trim().min(2).max(180),
-      dateOfBirth: z.coerce.date().optional(),
-      sex: z.string().trim().max(40).optional(),
-      phone: z.string().trim().max(40).optional(),
-      email: z.string().email().optional().or(z.literal("")),
-      address: z.string().trim().max(500).optional(),
-      emergencyContact: z.string().trim().max(500).optional(),
-    })).mutation(async ({ ctx, input }) => {
-      await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "doctor", "nurse", "receptionist"]);
-      const patient = await createPatient({ ...input, email: input.email || undefined, createdById: ctx.user.id });
-      await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "patient.created", entityType: "patient", entityId: String(patient.id) });
-      return patient;
-    }),
+    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), query: z.string().trim().max(120).optional() })).query(async ({ ctx, input }) => { const access = await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "doctor", "nurse", "receptionist", "laboratory_user", "radiology_user", "pharmacy_user", "auditor"]); const result = await listPatients(input.organizationId, input.query); await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "patient.list.viewed", entityType: "patient", metadata: { query: input.query ?? null, role: access.membership?.role ?? ctx.user.role } }); return result; }),
+    create: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), patientNumber: z.string().trim().min(2).max(64), fullName: z.string().trim().min(2).max(180), dateOfBirth: z.coerce.date().optional(), sex: z.string().trim().max(40).optional(), phone: z.string().trim().max(40).optional(), email: z.string().email().optional().or(z.literal("")), address: z.string().trim().max(500).optional(), emergencyContact: z.string().trim().max(500).optional() })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, clinicalRoles); const patient = await createPatient({ ...input, email: input.email || undefined, createdById: ctx.user.id }); await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "patient.created", entityType: "patient", entityId: String(patient.id) }); return patient; }),
   }),
-
   appointment: router({
-    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => {
-      await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "doctor", "nurse", "receptionist", "auditor"]);
-      return listAppointments(input.organizationId);
-    }),
+    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "doctor", "nurse", "receptionist", "auditor"]); return listAppointments(input.organizationId); }),
+    create: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), patientId: z.number().int().positive(), clinicianUserId: z.number().int().positive().optional(), scheduledAt: z.coerce.date(), department: z.string().trim().max(120).optional(), reason: z.string().trim().max(500).optional(), notes: z.string().trim().max(500).optional() })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, clinicalRoles); const appointment = await createAppointment({ ...input, createdById: ctx.user.id }); await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "appointment.created", entityType: "appointment", entityId: String(appointment.id) }); return appointment; }),
   }),
-
+  prescription: router({
+    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "doctor", "nurse", "pharmacy_user", "auditor"]); return listPrescriptions(input.organizationId); }),
+    create: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), patientId: z.number().int().positive(), appointmentId: z.number().int().positive().optional(), prescriptionNumber: z.string().trim().min(4).max(64), notes: z.string().trim().max(500).optional(), sourceDocumentKey: z.string().trim().max(512).optional(), items: z.array(z.object({ medicineName: z.string().trim().min(2).max(180), strength: z.string().trim().max(80).optional(), dosage: z.string().trim().max(120).optional(), duration: z.string().trim().max(120).optional(), quantity: z.number().int().positive().max(10000), instructions: z.string().trim().max(500).optional() })).min(1).max(30) })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, prescriptionRoles); const order = await createPrescription({ ...input, prescriberUserId: ctx.user.id }); await writeAuditLog({ organizationId: input.organizationId, actorUserId: ctx.user.id, action: "prescription.issued", entityType: "prescription", entityId: String(order.id) }); return order; }),
+  }),
+  document: router({
+    uploadPrescription: protectedProcedure.input(z.object({ organizationId: z.number().int().positive(), patientId: z.number().int().positive(), fileName: z.string().trim().min(1).max(180), mimeType: z.string().trim().max(120), dataBase64: z.string().max(8_000_000) })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, prescriptionRoles); if (!input.mimeType.startsWith("image/") && input.mimeType !== "application/pdf") throw new TRPCError({ code: "BAD_REQUEST", message: "Only an image or PDF prescription file is allowed." }); const db = await getDb(); if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." }); const uploaded = await storagePut(`prescriptions/${input.organizationId}/${input.patientId}/${input.fileName}`, Buffer.from(input.dataBase64, "base64"), input.mimeType); const inserted = await db.insert(documents).values({ organizationId: input.organizationId, patientId: input.patientId, uploadedById: ctx.user.id, title: input.fileName, documentType: "prescription_image", storageKey: uploaded.key, mimeType: input.mimeType }); return { documentId: Number(inserted[0].insertId), storageKey: uploaded.key, url: uploaded.url }; }),
+  }),
+  pharmacy: router({
+    lookup: protectedProcedure.input(z.object({ prescriptionNumber: z.string().trim().min(4).max(64) })).query(async ({ ctx, input }) => { const result = await findPrescription(input.prescriptionNumber); if (!result) throw new TRPCError({ code: "NOT_FOUND", message: "Prescription not found." }); if (ctx.user.role !== "admin" && ctx.user.role !== "management") { const memberships = await getMembershipsForUser(ctx.user.id); if (!memberships.some(({ membership }) => ["pharmacy_user", "hospital_admin"].includes(membership.role))) throw new TRPCError({ code: "FORBIDDEN", message: "Only pharmacy staff can verify prescriptions." }); } return result; }),
+    dispense: protectedProcedure.input(z.object({ prescriptionOrderId: z.number().int().positive(), pharmacyOrganizationId: z.number().int().positive(), patientId: z.number().int().positive(), notes: z.string().trim().max(500).optional() })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.pharmacyOrganizationId, ["pharmacy_user", "hospital_admin"]); const result = await dispensePrescription({ ...input, pharmacistUserId: ctx.user.id }); await writeAuditLog({ organizationId: input.pharmacyOrganizationId, actorUserId: ctx.user.id, action: "prescription.dispensed", entityType: "prescription", entityId: String(input.prescriptionOrderId) }); return result; }),
+    inventory: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["pharmacy_user", "hospital_admin", "auditor"]); return listInventory(input.organizationId); }),
+    suppliers: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["pharmacy_user", "hospital_admin"]); const db = await getDb(); if (!db) return []; return db.select().from(supplierProfiles).where(eq(supplierProfiles.status, "active")); }),
+    requestSupply: protectedProcedure.input(z.object({ pharmacyOrganizationId: z.number().int().positive(), supplierProfileId: z.number().int().positive(), orderNumber: z.string().trim().min(4).max(64), items: z.array(z.object({ medicineName: z.string().trim().min(2).max(180), quantityRequested: z.number().int().positive() })).min(1).max(50) })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.pharmacyOrganizationId, ["pharmacy_user", "hospital_admin"]); return createSupplyOrder({ ...input, requestedById: ctx.user.id }); }),
+  }),
+  supplier: router({
+    orders: protectedProcedure.query(async ({ ctx }) => { requireGlobalManagement(ctx); return listSupplyOrders(); }),
+    createOrder: protectedProcedure.input(z.object({ pharmacyOrganizationId: z.number().int().positive(), supplierProfileId: z.number().int().positive(), orderNumber: z.string().trim().min(4).max(64), items: z.array(z.object({ medicineName: z.string().trim().min(2).max(180), quantityRequested: z.number().int().positive() })).min(1).max(50) })).mutation(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.pharmacyOrganizationId, ["pharmacy_user", "hospital_admin"]); return createSupplyOrder({ ...input, requestedById: ctx.user.id }); }),
+    confirmOrder: protectedProcedure.input(z.object({ orderId: z.number().int().positive() })).mutation(async ({ ctx, input }) => { requireGlobalManagement(ctx); return confirmSupplyOrder(input.orderId, ctx.user.id); }),
+    profiles: protectedProcedure.query(async ({ ctx }) => { requireGlobalManagement(ctx); const db = await getDb(); if (!db) return []; return db.select().from(supplierProfiles).where(eq(supplierProfiles.status, "active")); }),
+    createProfile: protectedProcedure.input(z.object({ name: z.string().trim().min(2).max(180), contactName: z.string().trim().max(120).optional(), phone: z.string().trim().max(40).optional(), email: z.string().email().optional().or(z.literal("")), address: z.string().trim().max(500).optional() })).mutation(async ({ ctx, input }) => { requireGlobalManagement(ctx); const db = await getDb(); if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." }); const inserted = await db.insert(supplierProfiles).values({ ...input, email: input.email || undefined, createdById: ctx.user.id }); return { id: Number(inserted[0].insertId) }; }),
+  }),
   audit: router({
-    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => {
-      await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "auditor"]);
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." });
-      const { auditLogs } = await import("../drizzle/schema");
-      return db.select().from(auditLogs).where((await import("drizzle-orm")).eq(auditLogs.organizationId, input.organizationId)).orderBy((await import("drizzle-orm")).desc(auditLogs.createdAt));
-    }),
+    list: protectedProcedure.input(z.object({ organizationId: z.number().int().positive() })).query(async ({ ctx, input }) => { await requireOrganizationAccess(ctx, input.organizationId, ["hospital_admin", "auditor"]); const db = await getDb(); if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is not configured." }); const { auditLogs } = await import("../drizzle/schema"); return db.select().from(auditLogs).where(eq(auditLogs.organizationId, input.organizationId)).orderBy(auditLogs.createdAt); }),
   }),
 });
 
