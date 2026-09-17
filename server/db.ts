@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/mysql2";
 import {
   appointments,
   auditLogs,
+  documents,
   organizationMembers,
   organizations,
   patientCharges,
@@ -18,6 +19,7 @@ import {
   InsertUser,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import { randomBytes } from "node:crypto";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 export async function getDb() {
@@ -89,14 +91,37 @@ export async function listPatients(organizationId: number, query?: string) {
   const db = await getDb();
   if (!db) return [];
   const search = query?.trim();
-  const where = search ? and(eq(patients.organizationId, organizationId), or(like(patients.fullName, `%${search}%`), like(patients.patientNumber, `%${search}%`), like(patients.phone, `%${search}%`))) : eq(patients.organizationId, organizationId);
+  const where = search ? and(eq(patients.organizationId, organizationId), or(like(patients.fullName, `%${search}%`), like(patients.medicalNumber, `%${search}%`), like(patients.patientNumber, `%${search}%`), like(patients.citizenshipNumber, `%${search}%`), like(patients.phone, `%${search}%`))) : eq(patients.organizationId, organizationId);
   return db.select().from(patients).where(where).orderBy(desc(patients.createdAt));
 }
 
-export async function createPatient(input: { organizationId: number; patientNumber: string; fullName: string; dateOfBirth?: Date; sex?: string; phone?: string; email?: string; address?: string; emergencyContact?: string; createdById: number; }) {
+export async function listPatientsNational(query?: string) {
+  const db = await getDb();
+  if (!db) return [];
+  const search = query?.trim();
+  const where = search ? or(like(patients.fullName, `%${search}%`), like(patients.medicalNumber, `%${search}%`), like(patients.patientNumber, `%${search}%`), like(patients.phone, `%${search}%`), like(patients.citizenshipNumber, `%${search}%`)) : undefined;
+  return db.select({ patient: patients, organization: organizations }).from(patients).innerJoin(organizations, eq(patients.organizationId, organizations.id)).where(where).orderBy(desc(patients.createdAt));
+}
+
+export async function getPatientProfile(patientId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const patient = (await db.select({ patient: patients, organization: organizations }).from(patients).innerJoin(organizations, eq(patients.organizationId, organizations.id)).where(eq(patients.id, patientId)).limit(1))[0];
+  if (!patient) return null;
+  const [patientAppointments, patientPrescriptions, patientChargesRows, patientDocuments] = await Promise.all([
+    db.select({ appointment: appointments, organization: organizations }).from(appointments).innerJoin(organizations, eq(appointments.organizationId, organizations.id)).where(eq(appointments.patientId, patientId)).orderBy(desc(appointments.scheduledAt)),
+    db.select({ prescription: prescriptionOrders, items: prescriptionItems }).from(prescriptionOrders).leftJoin(prescriptionItems, eq(prescriptionOrders.id, prescriptionItems.prescriptionOrderId)).where(eq(prescriptionOrders.patientId, patientId)).orderBy(desc(prescriptionOrders.createdAt)),
+    db.select().from(patientCharges).where(eq(patientCharges.patientId, patientId)).orderBy(desc(patientCharges.createdAt)),
+    db.select().from(documents).where(eq(documents.patientId, patientId)).orderBy(desc(documents.createdAt)),
+  ]);
+  return { ...patient, appointments: patientAppointments, prescriptions: patientPrescriptions, charges: patientChargesRows, documents: patientDocuments };
+}
+
+export async function createPatient(input: { organizationId: number; patientNumber?: string; fullName: string; citizenshipNumber?: string; dateOfBirth?: Date; sex?: string; bloodGroup?: string; phone?: string; email?: string; address?: string; emergencyContact?: string; createdById: number; }) {
   const db = await getDb();
   if (!db) throw new Error("Database is not configured");
-  const inserted = await db.insert(patients).values(input);
+  const medicalNumber = `SFN-${Date.now().toString(36).toUpperCase()}-${randomBytes(4).toString("hex").toUpperCase()}`;
+  const inserted = await db.insert(patients).values({ ...input, patientNumber: input.patientNumber || medicalNumber, medicalNumber });
   return (await db.select().from(patients).where(eq(patients.id, Number(inserted[0].insertId))).limit(1))[0];
 }
 
@@ -225,7 +250,7 @@ export async function seedSamplePatients(organizationId: number, createdById: nu
   const existing = await db.select({ value: count() }).from(patients).where(eq(patients.organizationId, organizationId));
   if (Number(existing[0]?.value ?? 0) > 0) return { inserted: 0, skipped: true };
   const names = ["Pradeep Kumar Adhikari", "Anita Thapa", "Suresh Bahadur Gurung", "Mina Karki", "Ramesh Shrestha", "Sabina Rai", "Bikash Poudel", "Nirmala Tamang", "Deepak Bista", "Saraswati Khadka"];
-  const rows = names.map((fullName, index) => ({ organizationId, patientNumber: `NP-DEMO-${String(index + 1).padStart(4, "0")}`, fullName, sex: index % 2 === 0 ? "Male" : "Female", phone: `+977 98${String(10000000 + index * 1379).slice(0, 8)}`, address: index % 2 === 0 ? "Kathmandu, Bagmati" : "Lalitpur, Bagmati", createdById }));
+  const rows = names.map((fullName, index) => ({ organizationId, patientNumber: `NP-DEMO-${String(index + 1).padStart(4, "0")}`, medicalNumber: `SFN-DEMO-${String(index + 1).padStart(6, "0")}`, fullName, sex: index % 2 === 0 ? "Male" : "Female", phone: `+977 98${String(10000000 + index * 1379).slice(0, 8)}`, address: index % 2 === 0 ? "Kathmandu, Bagmati" : "Lalitpur, Bagmati", createdById }));
   await db.insert(patients).values(rows);
   return { inserted: rows.length, skipped: false };
 }

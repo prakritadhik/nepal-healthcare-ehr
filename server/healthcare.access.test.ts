@@ -46,4 +46,9 @@ describe("healthcare organization access", () => {
     const caller = appRouter.createCaller(createContext("user"));
     await expect(caller.management.dashboard()).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
+
+  it("keeps nationwide patient search away from ordinary users", async () => {
+    const caller = appRouter.createCaller(createContext("user"));
+    await expect(caller.management.patientSearch({ query: "SFN-" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
 });
