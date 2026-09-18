@@ -51,4 +51,9 @@ describe("healthcare organization access", () => {
     const caller = appRouter.createCaller(createContext("user"));
     await expect(caller.management.patientSearch({ query: "SFN-" })).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
+
+  it("does not expose a patient portal to an unlinked account", async () => {
+    const caller = appRouter.createCaller(createContext("user"));
+    await expect(caller.patient.portalMe()).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
 });
