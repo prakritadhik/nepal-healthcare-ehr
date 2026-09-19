@@ -56,4 +56,15 @@ describe("healthcare organization access", () => {
     const caller = appRouter.createCaller(createContext("user"));
     await expect(caller.patient.portalMe()).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
+
+  it("keeps clinical worklists behind an organization role boundary", async () => {
+    const caller = appRouter.createCaller(createContext("user"));
+    await expect(caller.clinical.list({ organizationId: 999999 })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(caller.clinical.completeRadiology({ organizationId: 999999, diagnosticOrderId: 1, resultText: "test" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("keeps pharmacy lookup and dispensing unavailable to ordinary users", async () => {
+    const caller = appRouter.createCaller(createContext("user"));
+    await expect(caller.pharmacy.lookup({ prescriptionNumber: "RX-test", pharmacyOrganizationId: 999999 })).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
 });

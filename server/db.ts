@@ -3,7 +3,9 @@ import { drizzle } from "drizzle-orm/mysql2";
 import {
   appointments,
   auditLogs,
+  diagnosticOrders,
   documents,
+  encounters,
   organizationMembers,
   organizations,
   patientCharges,
@@ -108,13 +110,15 @@ export async function getPatientProfile(patientId: number) {
   if (!db) return null;
   const patient = (await db.select({ patient: patients, organization: organizations }).from(patients).innerJoin(organizations, eq(patients.organizationId, organizations.id)).where(eq(patients.id, patientId)).limit(1))[0];
   if (!patient) return null;
-  const [patientAppointments, patientPrescriptions, patientChargesRows, patientDocuments] = await Promise.all([
+  const [patientAppointments, patientPrescriptions, patientChargesRows, patientDocuments, patientEncounters, patientDiagnostics] = await Promise.all([
     db.select({ appointment: appointments, organization: organizations }).from(appointments).innerJoin(organizations, eq(appointments.organizationId, organizations.id)).where(eq(appointments.patientId, patientId)).orderBy(desc(appointments.scheduledAt)),
     db.select({ prescription: prescriptionOrders, items: prescriptionItems }).from(prescriptionOrders).leftJoin(prescriptionItems, eq(prescriptionOrders.id, prescriptionItems.prescriptionOrderId)).where(eq(prescriptionOrders.patientId, patientId)).orderBy(desc(prescriptionOrders.createdAt)),
     db.select().from(patientCharges).where(eq(patientCharges.patientId, patientId)).orderBy(desc(patientCharges.createdAt)),
     db.select().from(documents).where(eq(documents.patientId, patientId)).orderBy(desc(documents.createdAt)),
+    db.select().from(encounters).where(eq(encounters.patientId, patientId)).orderBy(desc(encounters.createdAt)),
+    db.select().from(diagnosticOrders).where(eq(diagnosticOrders.patientId, patientId)).orderBy(desc(diagnosticOrders.createdAt)),
   ]);
-  return { ...patient, appointments: patientAppointments, prescriptions: patientPrescriptions, charges: patientChargesRows, documents: patientDocuments };
+  return { ...patient, appointments: patientAppointments, prescriptions: patientPrescriptions, charges: patientChargesRows, documents: patientDocuments, encounters: patientEncounters, diagnostics: patientDiagnostics };
 }
 
 export async function createPatient(input: { organizationId: number; patientNumber?: string; fullName: string; citizenshipNumber?: string; dateOfBirth?: Date; sex?: string; bloodGroup?: string; phone?: string; email?: string; address?: string; emergencyContact?: string; createdById: number; }) {
@@ -136,6 +140,27 @@ export async function createAppointment(input: { organizationId: number; patient
   if (!db) throw new Error("Database is not configured");
   const inserted = await db.insert(appointments).values(input);
   return (await db.select().from(appointments).where(eq(appointments.id, Number(inserted[0].insertId))).limit(1))[0];
+}
+
+export async function createEncounter(input: { organizationId: number; patientId: number; clinicianUserId: number; appointmentId?: number; encounterType: string; clinicalNote?: string; diagnosis?: string; severity?: "stable" | "needs_follow_up" | "urgent" | "critical"; carePlan?: string; followUpInstructions?: string; }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  const inserted = await db.insert(encounters).values({ ...input, severity: input.severity ?? "stable", status: "signed", signedAt: new Date() });
+  return (await db.select().from(encounters).where(eq(encounters.id, Number(inserted[0].insertId))).limit(1))[0];
+}
+
+export async function createDiagnosticOrder(input: { organizationId: number; patientId: number; orderedByUserId: number; modality: "laboratory" | "radiology"; testName: string; }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  const inserted = await db.insert(diagnosticOrders).values(input);
+  return (await db.select().from(diagnosticOrders).where(eq(diagnosticOrders.id, Number(inserted[0].insertId))).limit(1))[0];
+}
+
+export async function completeRadiologyOrder(input: { diagnosticOrderId: number; radiologistUserId: number; resultText?: string; resultDocumentKey?: string; }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  await db.update(diagnosticOrders).set({ status: "resulted", resultText: input.resultText, resultDocumentKey: input.resultDocumentKey, performedByUserId: input.radiologistUserId, performedAt: new Date() }).where(eq(diagnosticOrders.id, input.diagnosticOrderId));
+  return (await db.select().from(diagnosticOrders).where(eq(diagnosticOrders.id, input.diagnosticOrderId)).limit(1))[0];
 }
 
 export async function getHospitalDashboard(organizationId: number) {
@@ -167,13 +192,13 @@ export async function getManagementDashboard() {
   return { organizations: Number(orgRows[0]?.value ?? 0), patients: Number(patientRows[0]?.value ?? 0), doctors: Number(doctorRows[0]?.value ?? 0), staff: Number(staffRows[0]?.value ?? 0), prescriptions: Number(prescriptionRows[0]?.value ?? 0) };
 }
 
-export async function createPrescription(input: { organizationId: number; patientId: number; appointmentId?: number; prescriberUserId: number; prescriptionNumber: string; notes?: string; sourceDocumentKey?: string; items: Array<{ medicineName: string; strength?: string; dosage?: string; duration?: string; quantity: number; instructions?: string }>; }) {
+export async function createPrescription(input: { organizationId: number; patientId: number; appointmentId?: number; prescriberUserId: number; prescriptionNumber: string; notes?: string; sourceDocumentKey?: string; items: Array<{ medicineName: string; strength?: string; dosage?: string; duration?: string; quantity: number; dispensingMode?: "one_time" | "regular"; refillLimit?: number; instructions?: string }>; }) {
   const db = await getDb();
   if (!db) throw new Error("Database is not configured");
   return db.transaction(async (tx) => {
     const inserted = await tx.insert(prescriptionOrders).values({ organizationId: input.organizationId, patientId: input.patientId, appointmentId: input.appointmentId, prescriberUserId: input.prescriberUserId, prescriptionNumber: input.prescriptionNumber, notes: input.notes, sourceDocumentKey: input.sourceDocumentKey, status: "issued", issuedAt: new Date() });
     const orderId = Number(inserted[0].insertId);
-    await tx.insert(prescriptionItems).values(input.items.map(item => ({ ...item, prescriptionOrderId: orderId })));
+    await tx.insert(prescriptionItems).values(input.items.map(item => ({ ...item, prescriptionOrderId: orderId, dispensingMode: item.dispensingMode ?? "one_time", refillLimit: item.refillLimit ?? 0 })));
     return (await tx.select().from(prescriptionOrders).where(eq(prescriptionOrders.id, orderId)).limit(1))[0];
   });
 }
@@ -193,24 +218,31 @@ export async function findPrescription(prescriptionNumber: string) {
   return { ...order, items };
 }
 
-export async function dispensePrescription(input: { prescriptionOrderId: number; pharmacyOrganizationId: number; patientId: number; pharmacistUserId: number; notes?: string; }) {
+export async function dispensePrescription(input: { prescriptionOrderId: number; pharmacyOrganizationId: number; patientId: number; pharmacistUserId: number; quantityDispensed?: number; notes?: string; }) {
   const db = await getDb();
   if (!db) throw new Error("Database is not configured");
   return db.transaction(async (tx) => {
     const order = (await tx.select().from(prescriptionOrders).where(eq(prescriptionOrders.id, input.prescriptionOrderId)).limit(1))[0];
     if (!order || order.patientId !== input.patientId) throw new Error("Prescription could not be verified for this patient.");
     if (order.status === "dispensed" || order.status === "cancelled") throw new Error("This prescription is no longer available for dispensing.");
-    const previous = await tx.select().from(pharmacyDispensations).where(and(eq(pharmacyDispensations.prescriptionOrderId, input.prescriptionOrderId), eq(pharmacyDispensations.status, "completed"))).limit(1);
-    if (previous.length) throw new Error("This prescription has already been dispensed.");
     const items = await tx.select().from(prescriptionItems).where(eq(prescriptionItems.prescriptionOrderId, order.id));
+    if (!items.length) throw new Error("This prescription has no medicine items.");
     for (const item of items) {
-      const stock = (await tx.select().from(pharmacyInventory).where(and(eq(pharmacyInventory.organizationId, input.pharmacyOrganizationId), eq(pharmacyInventory.medicineName, item.medicineName))).limit(1))[0];
-      if (!stock || stock.quantityOnHand < item.quantity) throw new Error(`Insufficient stock for ${item.medicineName}.`);
-      await tx.update(pharmacyInventory).set({ quantityOnHand: stock.quantityOnHand - item.quantity }).where(eq(pharmacyInventory.id, stock.id));
+      const exhausted = item.dispensingMode === "one_time" ? item.refillsUsed >= 1 : item.refillLimit > 0 && item.refillsUsed >= item.refillLimit;
+      if (exhausted) throw new Error(`${item.medicineName} has reached its approved dispensing limit.`);
     }
-    await tx.insert(pharmacyDispensations).values(input);
-    await tx.update(prescriptionOrders).set({ status: "dispensed" }).where(eq(prescriptionOrders.id, order.id));
-    return { success: true, prescriptionOrderId: order.id };
+    for (const item of items) {
+      const requestedQuantity = items.length === 1 && input.quantityDispensed ? input.quantityDispensed : item.quantity;
+      const stock = (await tx.select().from(pharmacyInventory).where(and(eq(pharmacyInventory.organizationId, input.pharmacyOrganizationId), eq(pharmacyInventory.medicineName, item.medicineName))).limit(1))[0];
+      if (!stock || stock.quantityOnHand < requestedQuantity) throw new Error(`Insufficient stock for ${item.medicineName}.`);
+      await tx.update(pharmacyInventory).set({ quantityOnHand: stock.quantityOnHand - requestedQuantity }).where(eq(pharmacyInventory.id, stock.id));
+      await tx.update(prescriptionItems).set({ refillsUsed: item.refillsUsed + 1 }).where(eq(prescriptionItems.id, item.id));
+    }
+    const remaining = items.some(item => item.dispensingMode === "regular" && item.refillLimit > item.refillsUsed + 1);
+    const totalDispensed = input.quantityDispensed ?? items.reduce((sum, item) => sum + item.quantity, 0);
+    await tx.insert(pharmacyDispensations).values({ ...input, quantityDispensed: totalDispensed });
+    await tx.update(prescriptionOrders).set({ status: remaining ? "partially_dispensed" : "dispensed" }).where(eq(prescriptionOrders.id, order.id));
+    return { success: true, prescriptionOrderId: order.id, quantityDispensed: totalDispensed, remainingRefills: remaining };
   });
 }
 

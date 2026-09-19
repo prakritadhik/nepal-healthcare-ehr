@@ -16,6 +16,30 @@ export const users = mysqlTable("users", {
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
 });
 
+export const loginChallenges = mysqlTable("login_challenges", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  challengeToken: varchar("challengeToken", { length: 96 }).notNull().unique(),
+  codeHash: varchar("codeHash", { length: 128 }).notNull(),
+  ipAddress: varchar("ipAddress", { length: 64 }),
+  userAgent: varchar("userAgent", { length: 512 }),
+  expiresAt: timestamp("expiresAt").notNull(),
+  attempts: int("attempts").default(0).notNull(),
+  consumedAt: timestamp("consumedAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export const trustedDevices = mysqlTable("trusted_devices", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  deviceHash: varchar("deviceHash", { length: 128 }).notNull(),
+  ipAddress: varchar("ipAddress", { length: 64 }).notNull(),
+  userAgent: varchar("userAgent", { length: 512 }),
+  lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
+  expiresAt: timestamp("expiresAt").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, table => ({ trustedDeviceUnique: uniqueIndex("trusted_device_user_hash_unique").on(table.userId, table.deviceHash) }));
+
 export const organizations = mysqlTable("organizations", {
   id: int("id").autoincrement().primaryKey(),
   name: varchar("name", { length: 180 }).notNull(),
@@ -99,6 +123,9 @@ export const encounters = mysqlTable("encounters", {
   encounterType: varchar("encounterType", { length: 80 }).notNull(),
   clinicalNote: text("clinicalNote"),
   diagnosis: text("diagnosis"),
+  severity: mysqlEnum("severity", ["stable", "needs_follow_up", "urgent", "critical"]).default("stable").notNull(),
+  carePlan: text("carePlan"),
+  followUpInstructions: text("followUpInstructions"),
   status: mysqlEnum("status", ["draft", "signed", "amended"]).default("draft").notNull(),
   startedAt: timestamp("startedAt").defaultNow().notNull(),
   signedAt: timestamp("signedAt"),
@@ -144,6 +171,9 @@ export const prescriptionItems = mysqlTable("prescription_items", {
   dosage: varchar("dosage", { length: 120 }),
   duration: varchar("duration", { length: 120 }),
   quantity: int("quantity").notNull(),
+  dispensingMode: mysqlEnum("dispensingMode", ["one_time", "regular"]).default("one_time").notNull(),
+  refillLimit: int("refillLimit").default(0).notNull(),
+  refillsUsed: int("refillsUsed").default(0).notNull(),
   instructions: text("instructions"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
@@ -169,6 +199,7 @@ export const pharmacyDispensations = mysqlTable("pharmacy_dispensations", {
   pharmacyOrganizationId: int("pharmacyOrganizationId").notNull().references(() => organizations.id),
   patientId: int("patientId").notNull().references(() => patients.id),
   pharmacistUserId: int("pharmacistUserId").notNull().references(() => users.id),
+  quantityDispensed: int("quantityDispensed").default(0).notNull(),
   dispensedAt: timestamp("dispensedAt").defaultNow().notNull(),
   status: mysqlEnum("status", ["completed", "reversed"]).default("completed").notNull(),
   notes: text("notes"),
@@ -233,6 +264,9 @@ export const diagnosticOrders = mysqlTable("diagnostic_orders", {
   testName: varchar("testName", { length: 180 }).notNull(),
   status: mysqlEnum("status", ["ordered", "in_progress", "resulted", "verified", "released", "cancelled"]).default("ordered").notNull(),
   resultText: text("resultText"),
+  resultDocumentKey: varchar("resultDocumentKey", { length: 512 }),
+  performedByUserId: int("performedByUserId").references(() => users.id),
+  performedAt: timestamp("performedAt"),
   verifiedByUserId: int("verifiedByUserId").references(() => users.id),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
